@@ -1,6 +1,8 @@
 package main
 
 import (
+	"compress/gzip"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"os"
@@ -16,23 +18,26 @@ import (
 )
 
 type ebsVolume struct {
-	name     string
-	mount    string
-	volumeId string
+	Name     string
+	Mount    string
+	VolumeId string
 }
 
+const (
+	FILENAME = "/var/lib/blocker"
+)
 type ebsVolumeDriver struct {
 	ec2                 *ec2.EC2
 	ec2meta             *ec2metadata.EC2Metadata
 	awsInstanceId       string
 	awsRegion           string
 	awsAvailabilityZone string
-	volumes             map[string]*ebsVolume
+	Volumes             map[string]*ebsVolume
 }
 
 func NewEbsVolumeDriver() (VolumeDriver, error) {
 	d := &ebsVolumeDriver{
-		volumes: make(map[string]*ebsVolume),
+		Volumes: make(map[string]*ebsVolume),
 	}
 
 	ec2sess := session.New()
@@ -61,39 +66,55 @@ func NewEbsVolumeDriver() (VolumeDriver, error) {
 	log("\tInstanceId        : %v\n", d.awsInstanceId)
 	log("\tRegion            : %v\n", d.awsRegion)
 	log("\tAvailability Zone : %v\n", d.awsAvailabilityZone)
+
+	log("Looking for any current volume data")
+	err = d.Load(FILENAME)
+	if err != nil{
+		// err in loading the file for the first time.
+		// ditch it and create a new one.
+		saveErr := d.Save(FILENAME)
+		if saveErr != nil{
+			return nil, errors.New("Could not load current volume info, or create a new one.")
+		}
+	}
 	return d, nil
 }
 
 func (d *ebsVolumeDriver) Create(name string, opts map[string]string) error {
-	vol, exists := d.volumes[name]
+	vol, exists := d.Volumes[name]
 	if exists {
 		// Docker won't always cleanly remove entries.  It's okay so long
 		// as the target isn't already mounted by someone else.
-		if vol.mount != "" {
+		if vol.Mount != "" {
 			return errors.New("Name already in use.")
 		}
 	} else {
 		// Create a new volume, defaulting the ID to its name, and add it to the map.
-		vol = &ebsVolume{name: name, mount: "", volumeId: name}
-		d.volumes[name] = vol
+		vol = &ebsVolume{Name: name, Mount: "", VolumeId: name}
+		d.Volumes[name] = vol
 	}
 
 	// If a volume ID was given as an override, use it.
 	volumeId, exists := opts["volume_id"]
 	if exists {
-		vol.volumeId = volumeId
+		vol.VolumeId = volumeId
 	}
 
+	// save the state
+	err := d.Save(FILENAME)
+	if err != nil{
+		return errors.New(fmt.Sprintf("Error in saving volume state: %s", err.Error()))
+	}
 	return nil
 }
 
 func (d *ebsVolumeDriver) Mount(name string) (string, error) {
-	vol, exists := d.volumes[name]
+	vol, exists := d.Volumes[name]
 	if !exists {
 		return "", errors.New("Name not found.")
 	}
 
-	if vol.mount != "" {
+	if vol.Mount != "" {
 		return "", errors.New("Volume already mounted.")
 	}
 
@@ -101,45 +122,45 @@ func (d *ebsVolumeDriver) Mount(name string) (string, error) {
 }
 
 func (d *ebsVolumeDriver) Path(name string) (string, error) {
-	vol, exists := d.volumes[name]
+	vol, exists := d.Volumes[name]
 	if !exists {
 		return "", errors.New("Name not found.")
 	}
 
-	if vol.mount == "" {
+	if vol.Mount == "" {
 		return "", errors.New("Volume not mounted.")
 	}
 
-	return vol.mount, nil
+	return vol.Mount, nil
 }
 
 func (d *ebsVolumeDriver) Remove(name string) error {
-	vol, exists := d.volumes[name]
+	vol, exists := d.Volumes[name]
 	if !exists {
 		return errors.New("Name not found.")
 	}
 
 	// If the volume is still mounted, unmount it before removing it.
-	if vol.mount != "" {
+	if vol.Mount != "" {
 		err := d.doUnmount(vol)
 		if err != nil {
 			return err
 		}
 	}
 
-	delete(d.volumes, name)
+	delete(d.Volumes, name)
 	return nil
 }
 
 func (d *ebsVolumeDriver) Unmount(name string) error {
-	vol, exists := d.volumes[name]
+	vol, exists := d.Volumes[name]
 	if !exists {
 		return errors.New("Name not found.")
 	}
 
 	// If the volume is mounted, go ahead and unmount it.  Ignore requests
 	// to unmount volumes that aren't actually mounted.
-	if vol.mount != "" {
+	if vol.Mount != "" {
 		err := d.doUnmount(vol)
 		if err != nil {
 			return err
@@ -178,7 +199,7 @@ func (d *ebsVolumeDriver) doMount(vol *ebsVolume) (string, error) {
 	}
 
 	// Set the volume's mountpoint and return it.
-	vol.mount = mount
+	vol.Mount = mount
 	return mount, nil
 }
 
@@ -250,7 +271,7 @@ func (d *ebsVolumeDriver) attachVolume(vol *ebsVolume) (string, error) {
 	// Since detaching is asynchronous, we want to check first to see if the
 	// target volume is in the process of being detached.  If it is, we'll wait
 	// a little bit until it's ready to use.
-	err := d.waitUntilAvailable(vol.volumeId)
+	err := d.waitUntilAvailable(vol.VolumeId)
 	if err != nil {
 		return "", err
 	}
@@ -272,7 +293,7 @@ func (d *ebsVolumeDriver) attachVolume(vol *ebsVolume) (string, error) {
 		if _, err := d.ec2.AttachVolume(&ec2.AttachVolumeInput{
 			Device:     aws.String(dev),
 			InstanceId: aws.String(d.awsInstanceId),
-			VolumeId:   aws.String(vol.volumeId),
+			VolumeId:   aws.String(vol.VolumeId),
 		}); err != nil {
 			if awsErr, ok := err.(awserr.Error); ok &&
 				awsErr.Code() == "InvalidParameterValue" {
@@ -284,14 +305,14 @@ func (d *ebsVolumeDriver) attachVolume(vol *ebsVolume) (string, error) {
 			return "", err
 		}
 
-		err = d.waitUntilAttached(vol.volumeId)
+		err = d.waitUntilAttached(vol.VolumeId)
 		if err != nil {
 			return "", err
 		}
 
 		// Finally, the attach is complete.
 		log("\tAttached EBS volume name=%v/volumeId=%v to %v:%v.\n",
-			vol.name, vol.volumeId, d.awsInstanceId, dev)
+			vol.Name, vol.VolumeId, d.awsInstanceId, dev)
 		if _, err := os.Lstat(dev); os.IsNotExist(err) {
 			// On newer Linux kernels, /dev/sd* is mapped to /dev/xvd*.  See
 			// if that's the case.
@@ -312,12 +333,12 @@ func (d *ebsVolumeDriver) attachVolume(vol *ebsVolume) (string, error) {
 
 func (d *ebsVolumeDriver) doUnmount(vol *ebsVolume) error {
 	// First unmount the device.
-	if out, err := exec.Command("umount", vol.mount).CombinedOutput(); err != nil {
-		return fmt.Errorf("Unmounting %v failed: %v\n%v", vol.mount, err, string(out))
+	if out, err := exec.Command("umount", vol.Mount).CombinedOutput(); err != nil {
+		return fmt.Errorf("Unmounting %v failed: %v\n%v", vol.Mount, err, string(out))
 	}
 
 	// Remove the mountpoint from the filesystem.
-	if err := os.Remove(vol.mount); err != nil {
+	if err := os.Remove(vol.Mount); err != nil {
 		return err
 	}
 
@@ -327,19 +348,62 @@ func (d *ebsVolumeDriver) doUnmount(vol *ebsVolume) error {
 	}
 
 	// Clear out the mount information and return.
-	vol.mount = ""
+	vol.Mount = ""
 	return nil
 }
 
 func (d *ebsVolumeDriver) detachVolume(vol *ebsVolume) error {
 	if _, err := d.ec2.DetachVolume(&ec2.DetachVolumeInput{
 		InstanceId: aws.String(d.awsInstanceId),
-		VolumeId:   aws.String(vol.volumeId),
+		VolumeId:   aws.String(vol.VolumeId),
 	}); err != nil {
 		return err
 	}
 
 	log("\tDetached EBS volume name=%v/volumeId=%v from %v.\n",
-		vol.name, vol.volumeId, d.awsInstanceId)
+		vol.Name, vol.VolumeId, d.awsInstanceId)
+	return nil
+}
+
+func (d *ebsVolumeDriver) Load(filename string) error {
+
+	fi, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+
+	fz, err := gzip.NewReader(fi)
+	if err != nil {
+		return err
+	}
+	defer fz.Close()
+
+	decoder := gob.NewDecoder(fz)
+	err = decoder.Decode(&d.Volumes)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *ebsVolumeDriver) Save(filename string) error {
+
+	fi, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+
+	fz := gzip.NewWriter(fi)
+	defer fz.Close()
+
+	encoder := gob.NewEncoder(fz)
+	err = encoder.Encode(d.Volumes)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
