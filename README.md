@@ -1,6 +1,7 @@
 # Blocker
 
-Blocker is a ridiculously simple stateless volume plugin for Docker.  It makes
+Blocker is a ridiculously simple volume plugin for Docker, with simple state persistence i.e.
+it remebers what volumes it provisioned in a file, for uniformity across restarts.  It makes
 using [Amazon Elastic Block Store](https://aws.amazon.com/ebs/) volumes trivial,
 a pretty useful thing for microservices like databases.
 
